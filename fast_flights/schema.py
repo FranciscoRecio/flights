@@ -21,3 +21,4 @@ class Flight:
     stops: int
     delay: Optional[str]
     price: str
+    date: Optional[str] = None

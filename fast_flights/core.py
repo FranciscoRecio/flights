@@ -1,4 +1,7 @@
 from typing import List, Literal, Optional
+from itertools import groupby
+from operator import attrgetter
+from datetime import datetime, timedelta
 
 from selectolax.lexbor import LexborHTMLParser, LexborNode
 
@@ -155,4 +158,132 @@ def parse_response(
     if not flights:
         raise RuntimeError("No flights found:\n{}".format(r.text_markdown))
 
-    return Result(current_price=current_price, flights=[Flight(**fl) for fl in flights])  # type: ignore
+    return Result(current_price=current_price, flights=[Flight(**fl) for fl in flights])
+
+
+def _parse_duration(duration: str) -> int:
+    """Convert duration string to minutes for sorting"""
+    try:
+        hours, minutes = duration.replace(" hr ", ":").replace(" min", "").split(":")
+        return int(hours) * 60 + int(minutes)
+    except (ValueError, AttributeError):
+        return float('inf')  # Return infinity for invalid durations
+
+
+def _get_sort_key(sort_method: Literal["best", "price", "duration"]):
+    """Returns the appropriate sort key function based on sort method"""
+    if sort_method == "best":
+        return lambda f: (not f.is_best, float(f.price.replace("$", "").replace(",", "")), _parse_duration(f.duration))
+    elif sort_method == "price":
+        return lambda f: float(f.price.replace("$", "").replace(",", ""))
+    else:  # duration
+        return lambda f: _parse_duration(f.duration)
+
+
+def _sort_and_limit_flights(flights: List[Flight], sort_method: str, limit: int = 5) -> List[Flight]:
+    """Sort flights by given method and return top N results"""
+    return sorted(flights, key=_get_sort_key(sort_method))[:limit]
+
+
+def get_top_sorted_flights(
+    *,
+    flight_data: List[FlightData],
+    trip: Literal["round-trip", "one-way", "multi-city"],
+    passengers: Passengers,
+    seat: Literal["economy", "premium-economy", "business", "first"],
+    fetch_mode: Literal["common", "fallback", "force-fallback", "local"] = "common",
+    max_stops: Optional[int] = None,
+    sort_method: Literal["best", "price", "duration"] = "best",
+) -> Result:
+    # Get all flights first
+    result = get_flights(
+        flight_data=flight_data,
+        trip=trip,
+        passengers=passengers,
+        seat=seat,
+        fetch_mode=fetch_mode,
+        max_stops=max_stops,
+    )
+    
+    # Group flights by number of stops
+    flights_by_stops = {}
+    for stops, flights in groupby(sorted(result.flights, key=attrgetter("stops")), key=attrgetter("stops")):
+        # Sort flights within each stop group and take top 5
+        flights_by_stops[stops] = _sort_and_limit_flights(list(flights), sort_method)
+    
+    # Combine all top flights
+    top_flights = []
+    for stops in sorted(flights_by_stops.keys()):
+        top_flights.extend(flights_by_stops[stops])
+    
+    return Result(current_price=result.current_price, flights=top_flights)
+
+
+def get_best_flights_across_dates(
+    *,
+    start_date: datetime,
+    end_date: datetime,
+    from_airport: str,
+    to_airport: str,
+    trip: Literal["round-trip", "one-way", "multi-city"],
+    passengers: Passengers,
+    seat: Literal["economy", "premium-economy", "business", "first"],
+    fetch_mode: Literal["common", "fallback", "force-fallback", "local"] = "common",
+    max_stops: Optional[int] = None,
+    sort_method: Literal["best", "price", "duration"] = "best",
+) -> Result:
+    """Get best flights across a date range (maximum 5 days)"""
+    # Validate date range
+    date_diff = (end_date - start_date).days
+    if date_diff < 0:
+        raise ValueError("end_date must be after start_date")
+    if date_diff > 5:
+        raise ValueError("Maximum date range is 5 days")
+    
+    # Collect flights for each date
+    all_flights = []
+    price_levels = []  # Track all price levels
+    
+    current_date = start_date
+    while current_date <= end_date:
+        flight_data = [
+            FlightData(
+                date=current_date.strftime("%Y-%m-%d"),
+                from_airport=from_airport,
+                to_airport=to_airport,
+            )
+        ]
+        
+        # Get top flights for this date
+        result = get_top_sorted_flights(
+            flight_data=flight_data,
+            trip=trip,
+            passengers=passengers,
+            seat=seat,
+            fetch_mode=fetch_mode,
+            max_stops=max_stops,
+            sort_method=sort_method,
+        )
+        
+        # Track price levels
+        price_levels.append(result.current_price)
+            
+        # Add date information to flights
+        for flight in result.flights:
+            flight.date = current_date.strftime("%Y-%m-%d")
+        
+        all_flights.extend(result.flights)
+        current_date += timedelta(days=1)
+    
+    # Sort all flights and take top 5 overall
+    best_flights = _sort_and_limit_flights(all_flights, sort_method)
+    
+    # Determine overall price level (use the most common level, defaulting to the lowest)
+    if "low" in price_levels:
+        overall_price = "low"
+    elif "typical" in price_levels:
+        overall_price = "typical"
+    else:
+        overall_price = "high"
+    
+    return Result(current_price=overall_price, flights=best_flights)
